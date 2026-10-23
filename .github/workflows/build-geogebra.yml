@@ -1,0 +1,111 @@
+name: Build and deploy GeoGebra
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the azure-production environment after building
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Java toolchain and Gradle runtime
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      - name: Build Classic web assets
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/gradlew" -p "$GITHUB_WORKSPACE/source/web" \
+            :web:copyHtml :web:gwtCompile \
+            -Pgmodule=org.geogebra.web.Web3D -Pgworkers=2 \
+            --no-daemon --no-parallel --max-workers=2
+
+      - name: Package static website
+        shell: bash
+        run: |
+          war="$GITHUB_WORKSPACE/source/web/web/war"
+          site="$RUNNER_TEMP/geogebra-site"
+          test -s "$war/classic.html"
+          test -s "$war/web3d/web3d.nocache.js"
+          test -s "$war/css/bundles/bundle.css"
+          mkdir -p "$site"
+          cp -R "$war/web3d" "$war/css" "$site/"
+          cp "$war/classic.html" "$site/classic.html"
+          cp "$war/classic.html" "$site/index.html"
+
+      - name: Upload static website
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: geogebra-site
+          path: ${{ runner.temp }}/geogebra-site
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: ${{ inputs.deploy }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: azure-production
+    concurrency:
+      group: geogebra-azure-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check Azure configuration
+        shell: bash
+        run: |
+          : "${AZURE_STORAGE_ACCOUNT:?Set AZURE_STORAGE_ACCOUNT in azure-production}"
+          : "${AZURE_CLIENT_ID:?Set AZURE_CLIENT_ID in azure-production}"
+          : "${AZURE_TENANT_ID:?Set AZURE_TENANT_ID in azure-production}"
+          : "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID in azure-production}"
+
+      - name: Download static website
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: geogebra-site
+          path: ${{ runner.temp }}/geogebra-site
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publish static assets
+        shell: bash
+        run: |
+          az storage blob upload-batch \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --auth-mode login \
+            --destination '$web' \
+            --source "$RUNNER_TEMP/geogebra-site" \
+            --pattern '*' \
+            --overwrite true \
+            --content-cache-control no-cache \
+            --only-show-errors
